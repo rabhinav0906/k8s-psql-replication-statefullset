@@ -1,0 +1,148 @@
+apiVersion: v1
+data:
+  primary-setup.sh: |
+    #!/bin/bash
+    set -e
+
+    # Run this script only on the Primary Pod
+    if [ "$(hostname)" != "postgres-0" ]; then
+        exit 0
+    fi
+
+    echo "Configuring PostgreSQL Primary..."
+
+    # Enable streaming replication
+    cat >> "$PGDATA/postgresql.conf" <<EOF
+    listen_addresses = '*'
+    wal_level = replica
+    max_wal_senders = 10
+    max_replication_slots = 10
+    EOF
+
+    # Allow Standby servers to connect
+    cat >> "$PGDATA/pg_hba.conf" <<EOF
+    host replication ${REPLICATION_USER} 0.0.0.0/0 scram-sha-256
+    EOF
+
+    # Create the replication user
+    psql -v ON_ERROR_STOP=1 \
+        --username "$POSTGRES_USER" \
+        --dbname postgres \
+        --set=replication_user="$REPLICATION_USER" \
+        --set=replication_password="$REPLICATION_PASSWORD" <<'SQL'
+
+    SELECT format(
+        'CREATE ROLE %I WITH REPLICATION LOGIN PASSWORD %L',
+        :'replication_user',
+        :'replication_password'
+    ) \gexec
+
+    SQL
+
+    echo "Primary configuration completed."
+  standby-setup.sh: |
+    #!/bin/bash
+    set -e
+
+    PRIMARY_HOST="postgres-0.postgres-headless"
+    PRIMARY_PORT="5432"
+
+    echo "Starting Standby initialization..."
+
+    # Wait until Primary is ready
+    until pg_isready -h "$PRIMARY_HOST" \
+                      -p "$PRIMARY_PORT" \
+                      -U "$REPLICATION_USER"; do
+        echo "Waiting for Primary..."
+        sleep 5
+    done
+
+    # Bootstrap only if this is a fresh data directory
+    if [ ! -s "$PGDATA/PG_VERSION" ]; then
+
+        echo "Taking base backup from Primary..."
+
+        export PGPASSWORD="$REPLICATION_PASSWORD"
+
+        pg_basebackup \
+            -h "$PRIMARY_HOST" \
+            -p "$PRIMARY_PORT" \
+            -U "$REPLICATION_USER" \
+            -D "$PGDATA" \
+            -Fp \
+            -Xs \
+            -P \
+            -R
+
+        unset PGPASSWORD
+
+        echo "Standby initialization completed."
+
+    else
+        echo "Existing PostgreSQL data found."
+    fi
+
+    # Create password file AFTER base backup
+    export PGPASSFILE="$PGDATA/.pgpass"
+
+    printf '%s:%s:%s:%s:%s\n' \
+        "$PRIMARY_HOST" \
+        "$PRIMARY_PORT" \
+        "*" \
+        "$REPLICATION_USER" \
+        "$REPLICATION_PASSWORD" > "$PGPASSFILE"
+
+    chmod 600 "$PGPASSFILE"
+
+    echo "Standby configuration completed."
+  start.sh: |
+    #!/bin/bash
+    set -e
+
+    POD_NAME=$(hostname)
+
+    echo "Starting PostgreSQL Pod: $POD_NAME"
+
+    export PGPASSFILE="$PGDATA/.pgpass"
+
+    # Primary Pod
+    if [ "$POD_NAME" = "postgres-0" ]; then
+
+        echo "Initializing PostgreSQL as Primary..."
+
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+
+    # Standby Pods
+    else
+
+        echo "Initializing PostgreSQL as Standby..."
+
+        # Ensure PostgreSQL owns the persistent data directory
+        if [ "$(id -u)" -eq 0 ]; then
+            mkdir -p "$PGDATA"
+            chown -R postgres:postgres "$PGDATA"
+        fi
+
+        # Bootstrap only if database is empty
+        if [ ! -s "$PGDATA/PG_VERSION" ]; then
+
+            echo "Taking backup from Primary..."
+
+            if [ "$(id -u)" -eq 0 ]; then
+                gosu postgres bash /scripts/standby-setup.sh
+            else
+                bash /scripts/standby-setup.sh
+            fi
+
+        else
+            echo "Existing Standby database found."
+        fi
+
+        echo "Starting PostgreSQL..."
+
+        exec /usr/local/bin/docker-entrypoint.sh postgres
+
+    fi
+kind: ConfigMap
+metadata:
+  name: postgres-scripts
